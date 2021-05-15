@@ -160,6 +160,10 @@ VirtualProtectEx = ctypes.windll.kernel32.VirtualProtectEx
 VirtualProtectEx.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.LPVOID, ctypes.c_size_t, ctypes.wintypes.DWORD, ctypes.POINTER(ctypes.wintypes.DWORD))
 VirtualProtectEx.restype = ctypes.wintypes.LPVOID
 
+ReadProcessMemory = ctypes.windll.kernel32.ReadProcessMemory
+ReadProcessMemory.restype = ctypes.wintypes.BOOL
+ReadProcessMemory.argtypes = [ctypes.wintypes.HANDLE, ctypes.wintypes.LPCVOID, ctypes.wintypes.LPVOID, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+
 WriteProcessMemory = ctypes.windll.kernel32.WriteProcessMemory
 WriteProcessMemory.restype = ctypes.wintypes.BOOL
 WriteProcessMemory.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.LPVOID, ctypes.wintypes.LPVOID, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t))
@@ -230,6 +234,21 @@ if WORDSIZE == 8:
 
 
 class Memory:
+
+	def __init__(self, handle=None):
+		self.handle = handle
+
+	def read(self, addr, length):
+		if not self.handle:
+			buf = (ctypes.c_uint8 * length)()
+			ctypes.memmove(buf, addr, length)
+			return bytes(buf)
+		else:
+			buf = (ctypes.c_uint8 * length)()
+			bytes_read = ctypes.c_size_t()
+			ReadProcessMemory(self.handle, addr, ctypes.byref(buf), length, ctypes.byref(bytes_read))
+			return bytes(buf[:bytes_read.value])
+
 	def __getitem__(self, s):
 		if isinstance(s, int):
 			s = slice(s, None, None)
@@ -243,9 +262,7 @@ class Memory:
 
 		# data = bytes(PyMemoryView_FromMemory(s.start, ln, PyBUF_READ))
 
-		buf = (ctypes.c_uint8 * ln)()
-		ctypes.memmove(buf, s.start, ln)
-		data = bytes(buf)
+		data = self.read(s.start, ln)
 
 		if s.step is None or s.step == 1:
 			pass
@@ -264,6 +281,8 @@ class Memory:
 			return data
 
 	def __setitem__(self, s, v):
+		if self.handle:
+			raise ValueError('Not implemented for foreign processes')
 		if isinstance(s, int):
 			ln = 1
 		else:
@@ -272,13 +291,21 @@ class Memory:
 		ctypes.memmove(s.start, data, ln)
 
 	def cstr(self, addr, maxlen=1024):
-		return ctypes.string_at(addr).decode('ascii')
+		if not self.handle:
+			return ctypes.string_at(addr).decode('ascii')
+		else:
+			data = self.read(addr, maxlen)
+			if 0 in data:
+				data = data[:data.find(0)]
+			return data.decode('ascii')
 
 
 class Module:
 
 	def __init__(self, hModule, process_handle=None):
 		self.hModule = hModule
+		self.handle = process_handle or handle
+		self.memory = memory if not process_handle else Memory(process_handle)
 		cPath = ctypes.create_string_buffer(1024)
 		if process_handle:
 			assert GetModuleFileNameExA(process_handle, self.hModule, cPath, ctypes.c_ulong(1024)), f'GetModuleFileNameExA got {ctypes.windll.kernel32.GetLastError():x}'
@@ -291,7 +318,7 @@ class Module:
 		self.export_directory_data = self.import_directory_data = None
 
 		module_info = MODULEINFO()
-		res = GetModuleInformation(handle, self.hModule, ctypes.byref(module_info), ctypes.sizeof(module_info))
+		res = GetModuleInformation(self.handle, self.hModule, ctypes.byref(module_info), ctypes.sizeof(module_info))
 		if res:
 			self.lpBaseOfDll = module_info.lpBaseOfDll
 			self.SizeOfImage = module_info.SizeOfImage
@@ -299,29 +326,33 @@ class Module:
 
 			if self.lpBaseOfDll:
 				DosHeader = self.lpBaseOfDll
-				MZSignature = memory[DosHeader:DosHeader + 2]
+				MZSignature = self.memory[DosHeader:DosHeader + 2]
 				assert MZSignature == b'\x4d\x5a'
 				AddressOfNewExeHeader = DosHeader + 60
 
 				# https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-image_nt_headers32
 				# https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-image_nt_headers64
-				NtHeader = DosHeader + memory[AddressOfNewExeHeader::4]
-				Signature = memory[NtHeader:NtHeader + 4]
+				NtHeader = DosHeader + self.memory[AddressOfNewExeHeader::4]
+				Signature = self.memory[NtHeader:NtHeader + 4]
 				assert Signature == b'\x50\x45\x00\x00'
 
 				# https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-image_optional_header32
 				# https://docs.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-image_optional_header64
 				OptionalHeader = NtHeader + 24
-				Magic = memory[OptionalHeader:OptionalHeader + 2]
-				if WORDSIZE == 4:
+				Magic = self.memory[OptionalHeader:OptionalHeader + 2]
+				if Magic == b'\x0b\x01':
+					if WORDSIZE != 4:
+						raise ValueError('OptionalHeader magic specifies module as 32bit, but we are a 64bit process')
 					DataDirectory = OptionalHeader + 96
-					assert Magic == b'\x0b\x01'
-				else:
-					assert Magic == b'\x0b\x02'
+				elif Magic == b'\x0b\x02':
+					if WORDSIZE != 8:
+						raise ValueError('OptionalHeader magic specifies module as 64bit, but we are a 32bit process')
 					DataDirectory = OptionalHeader + 112
+				else:
+					raise ValueError(f'OptionalHeader magic mismatch: got {Magic.hex()}')
 
-				self.export_directory_data = tuple(memory[DataDirectory:DataDirectory + 8:4])
-				self.import_directory_data = tuple(memory[DataDirectory + 8:DataDirectory + 16:4])
+				self.export_directory_data = tuple(self.memory[DataDirectory:DataDirectory + 8:4])
+				self.import_directory_data = tuple(self.memory[DataDirectory + 8:DataDirectory + 16:4])
 
 	class Exports(list):
 		@cached_property
@@ -354,11 +385,11 @@ class Module:
 		# Some modules might fail GetModuleInformation, so have export_directory_data=None, some modules (e.g. exes) might have no exports (export_directory_data.VirtualAddress = 0)
 		if self.export_directory_data and self.export_directory_data[0] != 0:
 			ExportDir = self.base + self.export_directory_data[0]
-			NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals = memory[ExportDir + 20:ExportDir + 40:4]
+			NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals = self.memory[ExportDir + 20:ExportDir + 40:4]
 
-			function_addrs = memory[self.base + AddressOfFunctions:self.base + AddressOfFunctions + 4 * NumberOfFunctions:4]
-			name_addrs = memory[self.base + AddressOfNames: self.base + AddressOfNames + 4 * NumberOfNames:4]
-			name_ordinals = memory[self.base + AddressOfNameOrdinals: self.base + AddressOfNameOrdinals + 2 * NumberOfNames:2]
+			function_addrs = self.memory[self.base + AddressOfFunctions:self.base + AddressOfFunctions + 4 * NumberOfFunctions:4]
+			name_addrs = self.memory[self.base + AddressOfNames: self.base + AddressOfNames + 4 * NumberOfNames:4]
+			name_ordinals = self.memory[self.base + AddressOfNameOrdinals: self.base + AddressOfNameOrdinals + 2 * NumberOfNames:2]
 
 			functions = []
 			for i, func_addr in enumerate(function_addrs):
@@ -368,7 +399,7 @@ class Module:
 				# If an export only has an ordinal, ignore it...
 				# This means we might miss some exports, but some windows DLLs have 100s of junk ordinal-only exports
 				function_addr = functions[i][2]
-				exports.append(self.Export(i + 1, memory.cstr(self.base + name_addr), function_addr, self.base + AddressOfFunctions + 4 * i))
+				exports.append(self.Export(i + 1, self.memory.cstr(self.base + name_addr), function_addr, self.base + AddressOfFunctions + 4 * i))
 
 			exports.sort()
 		return self.Exports(exports)
@@ -439,16 +470,16 @@ class Module:
 		ImportDir = self.base + self.import_directory_data[0]
 		current_import_descriptor = ImportDir
 		for _ in range(self.import_directory_data[1] // 20):
-			OriginalFirstThunk, TimeDateStamp, ForwarderChain, Name, FirstThunk = memory[current_import_descriptor:current_import_descriptor + 20:4]
+			OriginalFirstThunk, TimeDateStamp, ForwarderChain, Name, FirstThunk = self.memory[current_import_descriptor:current_import_descriptor + 20:4]
 			if not OriginalFirstThunk:
 				break
 
-			module_name = memory.cstr(self.base + Name)
+			module_name = self.memory.cstr(self.base + Name)
 			# print(f'{module_name.ljust(42)} OriginalFirstThunk=0x{self.base + OriginalFirstThunk:016x}, FirstThunk=0x{self.base + FirstThunk:016x}')
 
 			functions = []
 			for i in range(4096):
-				original_thunk_rva = memory[self.base + OriginalFirstThunk + i * WORDSIZE::WORDSIZE]
+				original_thunk_rva = self.memory[self.base + OriginalFirstThunk + i * WORDSIZE::WORDSIZE]
 				func_ptr_addr = self.base + FirstThunk + i * WORDSIZE
 				if not original_thunk_rva:
 					break
@@ -457,7 +488,7 @@ class Module:
 					# ordinal
 					func_name_ord = original_thunk_rva & 0xffff
 				else:
-					func_name_ord = memory.cstr(self.base + original_thunk_rva + 2)
+					func_name_ord = self.memory.cstr(self.base + original_thunk_rva + 2)
 
 				functions.append(self.FunctionImport(func_name_ord, func_ptr_addr))
 
@@ -470,6 +501,10 @@ class Module:
 	def base(self):
 		return self.lpBaseOfDll or self.hModule
 	
+	def __str__(self):
+		return f'Module(name={self.name!r}, path={self.path!r}, <{len(self.imports)} imports>, <{len(self.exports)})'
+	__repr__ = __str__
+
 
 class Modules(dict):
 
@@ -1080,6 +1115,32 @@ def hook_iat(target_module, func_desc, return_pop=0, resolve_ordinal_imports=Tru
 	return try_insert_iat_hook
 
 
+def getpid(processname):
+	pid = None
+	hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+	try:
+		pe32 = PROCESSENTRY32()
+		pe32.dwSize = ctypes.sizeof(PROCESSENTRY32)
+		if not Process32First(hProcessSnap, ctypes.byref(pe32)):
+			raise ValueError('Failed getting first process entry')
+		while True:
+			exe_file = pe32.szExeFile.decode()
+			if exe_file.lower() == processname.lower() or exe_file.lower() + '.exe' == processname.lower():
+				print(f'  - Found process {exe_file!r} with pid={pe32.th32ProcessID}')
+				pid = int(pe32.th32ProcessID)
+				break
+			if not Process32Next(hProcessSnap, ctypes.byref(pe32)):
+				break
+	except:
+		raise ValueError('Failed to enumerate/check processes')
+	finally:
+		CloseHandle(hProcessSnap)
+	if not pid:
+		raise ValueError(f"Can't find process matching {pid_or_processname}")
+
+	return pid
+
+
 def inject(pid_or_processname, module_or_filename=None, process_handle=None, alloc_console=False, wait_for_thread=False):
 	if not process_handle:
 		print(f' * Injecting into {pid_or_processname}')
@@ -1088,28 +1149,7 @@ def inject(pid_or_processname, module_or_filename=None, process_handle=None, all
 		pid = pid_or_processname
 	else:
 		print(f'  - Looking for process')
-		pid = None
-
-		hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-		try:
-			pe32 = PROCESSENTRY32()
-			pe32.dwSize = ctypes.sizeof(PROCESSENTRY32)
-			if not Process32First(hProcessSnap, ctypes.byref(pe32)):
-				raise ValueError('Failed getting first process entry')
-			while True:
-				exe_file = pe32.szExeFile.decode()
-				if exe_file.lower() == pid_or_processname.lower():
-					print(f'  - Found process {exe_file!r} with pid={pe32.th32ProcessID}')
-					pid = int(pe32.th32ProcessID)
-					break
-				if not Process32Next(hProcessSnap, ctypes.byref(pe32)):
-					break
-		except:
-			raise ValueError('Failed to enumerate/check processes')
-		finally:
-			CloseHandle(hProcessSnap)
-		if not pid:
-			raise ValueError(f"Can't find process matching {pid_or_processname}")
+		pid = getpid(pid_or_processname)
 
 	process_is_suspended = process_handle is not None
 	if not process_handle:
@@ -1322,7 +1362,6 @@ except:
 		patch.int8()
 
 	print(f'   ~ Calling CreateRemoteThread (function=0x{injection_stub_entry:08x})')
-	input('Waiting')
 	remote_thread = CreateRemoteThread(process_handle, None, 0, injection_stub_entry, None, 0, None)
 	assert remote_thread
 	print(f'   ~ Created remote thread 0x{remote_thread:x}')
@@ -1336,23 +1375,23 @@ except:
 	CloseHandle(process_handle)
 
 
-def launch(commandline, __file__, alloc_console=False):
-	print(f' * Starting and injecting into {commandline!r}')
-	if isinstance(commandline, list):
-		commandline = ' '.join(commandline)
+def launch(cmdline, file_to_inject, alloc_console=False):
+	print(f' * Starting and injecting into {cmdline!r}')
+	if isinstance(cmdline, list):
+		cmdline = ' '.join(cmdline)
 
 	print(f'  - Creating process in SUSPENDED state')
 	creation_flags = CREATE_SUSPENDED | CREATE_NEW_CONSOLE
 	startupinfo = STARTUPINFO()
 	startupinfo.cb = ctypes.sizeof(startupinfo)
 	processinfo = PROCESS_INFORMATION()
-	p = CreateProcessW(None, commandline, None, None, False, creation_flags, None, None, ctypes.byref(startupinfo), ctypes.byref(processinfo))
+	p = CreateProcessW(None, cmdline, None, None, False, creation_flags, None, None, ctypes.byref(startupinfo), ctypes.byref(processinfo))
 	if not p:
 		raise ValueError(f'CreateProcessW failed. Error=0x{ctypes.windll.kernel32.GetLastError():x}')
 
 	print(f'  - Process created with pid={processinfo.dwProcessId}, handle=0x{processinfo.hProcess:x}')
 
-	inject(processinfo.dwProcessId, __file__, process_handle=processinfo.hProcess, alloc_console=alloc_console, wait_for_thread=True)
+	inject(processinfo.dwProcessId, file_to_inject, process_handle=processinfo.hProcess, alloc_console=alloc_console, wait_for_thread=True)
 
 	print(f'  - Resuming main thread')
 	ResumeThread(processinfo.hThread)
