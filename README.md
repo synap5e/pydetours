@@ -95,7 +95,7 @@ Hooked functions are passed a `Registers` object, representing the registers at 
 Modifications to this object will modify the register state on completion of the hook (with the exception of the stack pointer).
 
 ```python
-@hook('foo.dll+0x112233', position_independent_bytes=7)
+@hook('foo.exe+0x112233', position_independent_bytes=7)
 def foo_hook(r):
 	r.eax += 10
 ```
