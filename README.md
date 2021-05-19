@@ -131,12 +131,12 @@ Additionally you can inspect the modules of a running foreign process using the 
  'ws2_32.dll': Module(name='ws2_32.dll', path='C:\\WINDOWS\\System32\\WS2_32.dll', <31 imports>, <180 exports>)}
 >>>
 >>> pprint(modules['ncat.exe'].imports['ws2_32.dll'].by_name)
-{'WSACloseEvent': ResolvedFunctionImport(ordinal=45, name='WSACloseEvent', by_ordinal=False, thunk=11466840, resolved_address=1989827904),
+{'WSACloseEvent': ResolvedFunctionImport(ordinal=45, name='WSACloseEvent', by_ordinal=False, thunk=4716632, original_address=1989827904, resolved_address=1989827904),
 # ... snip
- 'accept': ResolvedFunctionImport(ordinal=1, name='accept', by_ordinal=False, thunk=11466824, resolved_address=1989822016),
- 'bind': ResolvedFunctionImport(ordinal=2, name='bind', by_ordinal=False, thunk=11466796, resolved_address=1989791120),
- 'closesocket': ResolvedFunctionImport(ordinal=3, name='closesocket', by_ordinal=False, thunk=11466916, resolved_address=1989792576),
- 'connect': ResolvedFunctionImport(ordinal=4, name='connect', by_ordinal=False, thunk=11466820, resolved_address=1989823968),
+ 'accept': ResolvedFunctionImport(ordinal=1, name='accept', by_ordinal=False, thunk=4716616, original_address=1989822016, resolved_address=1989822016),
+ 'bind': ResolvedFunctionImport(ordinal=2, name='bind', by_ordinal=False, thunk=4716588, original_address=1989791120, resolved_address=56164352),
+ 'closesocket': ResolvedFunctionImport(ordinal=3, name='closesocket', by_ordinal=False, thunk=4716708, original_address=1989792576, resolved_address=1989792576),
+ 'connect': ResolvedFunctionImport(ordinal=4, name='connect', by_ordinal=False, thunk=4716612, original_address=1989823968, resolved_address=1989823968),
 # ... snip
  'socket': ResolvedFunctionImport(ordinal=23, name='socket', by_ordinal=False, thunk=11466808, resolved_address=1989786320)}
  ```

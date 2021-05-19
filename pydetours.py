@@ -414,7 +414,7 @@ class Module:
 			return {m.name.lower(): m for m in self}
 		def __getitem__(self, e):
 			if isinstance(e, str):
-				return self.by_name[e]
+				return self.by_name[e.lower()]
 			else:
 				return super().__getitem__(e)
 
@@ -426,11 +426,13 @@ class Module:
 			by_ordinal: bool
 			
 			thunk: int
+			original_address: int
 			resolved_address: int
 
-		def __init__(self, name, unresolved):
+		def __init__(self, name, unresolved, handle=None):
 			self.name = name
 			self.unresolved = unresolved
+			self.memory = memory if not handle else Memory(handle)
 
 		@cached_property
 		def resolved(self):
@@ -439,7 +441,10 @@ class Module:
 				exports = modules[self.name.lower()].exports.by_name_and_ordinal
 				for i, a in self.unresolved:
 					exp = exports.get(i)
-					resolved_imports.append(self.ResolvedFunctionImport(exp.ordinal, exp.name, i is int, a, exp.address))
+					new_resolved_address = self.memory[a::WORDSIZE]
+					if exp.address != new_resolved_address:
+						print(f' > {self.name}!{exp.name} (thunk=0x{a:08x}) changed resolved address 0x{exp.address:08x} => 0x{new_resolved_address:08x}')
+					resolved_imports.append(self.ResolvedFunctionImport(exp.ordinal, exp.name, i is int, a, exp.address, new_resolved_address))
 
 			return resolved_imports
 
@@ -492,7 +497,7 @@ class Module:
 
 				functions.append(self.FunctionImport(func_name_ord, func_ptr_addr))
 
-			imports.append(self.ModuleImport(module_name, functions))
+			imports.append(self.ModuleImport(module_name, functions, handle=self.handle))
 
 			current_import_descriptor += 20
 		return self.Imports(imports)
@@ -502,7 +507,7 @@ class Module:
 		return self.lpBaseOfDll or self.hModule
 	
 	def __str__(self):
-		return f'Module(name={self.name!r}, path={self.path!r}, <{len(self.imports)} imports>, <{len(self.exports)})'
+		return f'Module(name={self.name!r}, path={self.path!r}, <{len(self.imports)} imports>, <{len(self.exports)} exports>)'
 	__repr__ = __str__
 
 
@@ -1085,7 +1090,7 @@ def insert_iat_hook(target_module, func_desc, func, return_pop=0, resolve_ordina
 		else:
 			iat_entry = module_imports.by_ordinal[func_ord]
 
-	print(f'  - Resolved {target_module}:{func_desc} -> thunk=0x{iat_entry.thunk:08x}')
+	print(f'  - Resolved {target_module}:{func_desc} -> thunk=0x{iat_entry.thunk:08x} -> 0x{iat_entry.resolved_address:08x}')
 
 	landing_address = make_landing(func, iat_entry.resolved_address, target_module + ':' + func_desc, iat_entry.resolved_address, return_pop=return_pop)
 
@@ -1136,7 +1141,7 @@ def getpid(processname):
 	finally:
 		CloseHandle(hProcessSnap)
 	if not pid:
-		raise ValueError(f"Can't find process matching {pid_or_processname}")
+		raise ValueError(f"Can't find process matching {processname}")
 
 	return pid
 
