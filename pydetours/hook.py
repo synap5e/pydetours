@@ -32,6 +32,7 @@ from pydetours.pe32_module import (
     modules,
     own_process_handle,
     resolve_addr,
+    FindPattern,
 )
 from pydetours.pointer import BasePointer, is_pointer
 from pydetours.thiscall import make_thiscall
@@ -45,13 +46,13 @@ from pydetours.thiscall import make_thiscall
 # )
 
 
-
 if typing.TYPE_CHECKING:
     CData = ctypes._CData  # type: ignore
     SimpleCData = ctypes._SimpleCData  # type: ignore
 else:
     CData = typing.Any
     T = typing.TypeVar("T")
+
     class SimpleCData(typing.Generic[T]):
         pass
 
@@ -60,36 +61,31 @@ logger = logging.getLogger("pydetours.patcher")
 in_hooked_process = getattr(sys, "in_hooked_process", False)
 
 
-_dontgc = list[object]()  # don't garbage collect otherwise dangling objects - they are needed in the hooks
+_dontgc = list[
+    object
+]()  # don't garbage collect otherwise dangling objects - they are needed in the hooks
 _already_hooked = getattr(sys, "_already_hooked", {})
 setattr(sys, "_already_hooked", _already_hooked)
 
 
-HEXDIGITS = '0123456789abcdefABCDEF'
+HEXDIGITS = "0123456789abcdefABCDEF"
 
-ALLOWED_PADDING = [   # Function padding/alignments bytes that are allowed to be overwritten without consequence.
+ALLOWED_PADDING = [  # Function padding/alignments bytes that are allowed to be overwritten without consequence.
     b"\xcc",  # INT3: padding between functions - not used by normal code.
     b"\x90",  # NOP
-
     # GCC's alignments
-
     # 00007FF6DE7319F9 | 0F1F80 00000000                           | nop dword ptr ds:[rax],eax                     |
-    b"\x0F\x1F\x80\x00\x00\x00\x00",  # nop dword ptr ds:[rax],eax
-
+    b"\x0f\x1f\x80\x00\x00\x00\x00",  # nop dword ptr ds:[rax],eax
     # 00007FF6DE731A37 | 66:0F1F8400 00000000                      | nop word ptr ds:[rax+rax],ax                   |
-    b"\x66\x0F\x1F\x84\x00\x00\x00\x00",  # nop word ptr ds:[rax+rax],ax
-
+    b"\x66\x0f\x1f\x84\x00\x00\x00\x00",  # nop word ptr ds:[rax+rax],ax
     # 00007FF6DE731A73 | 66662E:0F1F8400 00000000                  | nop word ptr cs:[rax+rax],ax                   |
-    b"\x66\x0F\x1F\x84\x00\x00\x00\x00\x00",  # nop word ptr ds:[rax+rax],ax
-
+    b"\x66\x0f\x1f\x84\x00\x00\x00\x00\x00",  # nop word ptr ds:[rax+rax],ax
     # 00007FF6DE731A73 | 66662E:0F1F8400 00000000                  | nop word ptr cs:[rax+rax],ax                   |
     # 00007FF6DE731A7E | 66:90                                     | nop                                            |
-    b"\x66\x0F\x1F\x84\x00\x00\x00\x00\x00\x66\x90",  # nop word ptr ds:[rax+rax],ax; nop
-
-
+    b"\x66\x0f\x1f\x84\x00\x00\x00\x00\x00\x66\x90",  # nop word ptr ds:[rax+rax],ax; nop
     # 00007FF7AFCC1872 | 66662E:0F1F8400 00000000                  | nop word ptr cs:[rax+rax],ax                   |
     #   00007FF7AFCC187D | 0F1F00                                    | nop dword ptr ds:[rax],eax                     |
-    b"\x66\x0F\x1F\x84\x00\x00\x00\x00\x00\x0F\x1F\x00",  # nop word ptr ds:[rax+rax],ax; nop dword ptr ds:[rax],eax
+    b"\x66\x0f\x1f\x84\x00\x00\x00\x00\x00\x0f\x1f\x00",  # nop word ptr ds:[rax+rax],ax; nop dword ptr ds:[rax],eax
 ]
 ALLOWED_PROLOGUES = [
     "55 8b ec",  # push ebp; mov ebp, esp - only 3 bytes (normal jump requires 5, but if there is padding bytes above, we can reljmp -7)
@@ -113,11 +109,15 @@ if WORDSIZE == 8:
         "55 48 8b ec 48 83 e4 ??",  #  push rbp; mov rbp, rsp; and rsp, ?? - or aligning the stack
         "55 48 89 e5 48 83 ec ??",  #  push rbp; mov rbp, rsp; sub rsp, ?? - as above but with alternate encodings for mov
         "55 48 89 e5 48 83 e4 ??",  #  push rbp; mov rbp, rsp; and rsp, ??
-        "48 89 4C 24 08 56 57",     #  mov qword ptr [rsp+8], rcx; push rsi; push rdi
-        "40 55 53 57 48 8b ec",     #  push rbp; push rbx; push rdi; mov rbp, rsp    
+        "48 89 4C 24 08 56 57",  #  mov qword ptr [rsp+8], rcx; push rsi; push rdi
+        "40 55 53 57 48 8b ec",  #  push rbp; push rbx; push rdi; mov rbp, rsp
+        "40 53 b8 ?? ?? ?? ??",  #  push rbx; mov eax, ??
+        "40 56 b8 ?? ?? ?? ??",  #  push rsi; mov eax, ??
+        "40 57 b8 ?? ?? ?? ??",  #  push rdi; mov eax, ??
     ]
     # 40 55 53 57 48 8b ec 48 83
 # TODO: parse asm directly to find length of PIC - like https://github.com/lunarjournal/cdl86/blob/master/cdl.c#L814 but also detect IP-relative instructions
+
 
 class InHook:
     """
@@ -173,20 +173,12 @@ def make_patch_to_py(patch: Patch, pyfunc: typing.Callable[[int], bool]) -> None
     # PyTuple_Pack = modules[PYTHON_DLL].exports['PyTuple_Pack'].address
     # PyLong_FromVoidPtr = modules[PYTHON_DLL].exports['PyLong_FromVoidPtr'].address
     # PyObject_CallObject = modules[PYTHON_DLL].exports['PyObject_CallObject'].address
-    PyGILState_Ensure = ctypes.cast(
-        ctypes.pythonapi.PyGILState_Ensure, ctypes.c_void_p
-    ).value
-    PyGILState_Release = ctypes.cast(
-        ctypes.pythonapi.PyGILState_Release, ctypes.c_void_p
-    ).value
+    PyGILState_Ensure = ctypes.cast(ctypes.pythonapi.PyGILState_Ensure, ctypes.c_void_p).value
+    PyGILState_Release = ctypes.cast(ctypes.pythonapi.PyGILState_Release, ctypes.c_void_p).value
     Py_DecRef = ctypes.cast(ctypes.pythonapi.Py_DecRef, ctypes.c_void_p).value
     PyTuple_Pack = ctypes.cast(ctypes.pythonapi.PyTuple_Pack, ctypes.c_void_p).value
-    PyLong_FromVoidPtr = ctypes.cast(
-        ctypes.pythonapi.PyLong_FromVoidPtr, ctypes.c_void_p
-    ).value
-    PyObject_CallObject = ctypes.cast(
-        ctypes.pythonapi.PyObject_CallObject, ctypes.c_void_p
-    ).value
+    PyLong_FromVoidPtr = ctypes.cast(ctypes.pythonapi.PyLong_FromVoidPtr, ctypes.c_void_p).value
+    PyObject_CallObject = ctypes.cast(ctypes.pythonapi.PyObject_CallObject, ctypes.c_void_p).value
 
     assert (
         PyGILState_Ensure
@@ -266,13 +258,24 @@ def make_patch_to_py(patch: Patch, pyfunc: typing.Callable[[int], bool]) -> None
 
 
 Encoding = typing.TypeVar("Encoding")
+
+
 class StringArg(str, typing.Generic[Encoding]):
     pass
 
 
-HookableFunctionConvertableArg = int | bool | bytes | SimpleCData[typing.Any] | BasePointer[typing.Any] | StringArg[typing.Any] | None
+HookableFunctionConvertableArg = (
+    int
+    | bool
+    | bytes
+    | SimpleCData[typing.Any]
+    | BasePointer[typing.Any]
+    | StringArg[typing.Any]
+    | None
+)
 # TODO: as soon as we get value constraints on TypeVarTuple we can make this actually types
 HookableFunction = typing.Callable[..., int | None]
+
 
 class HookedFunction(typing.Protocol):
     in_hook: InHook
@@ -283,6 +286,7 @@ class HookedFunction(typing.Protocol):
 
     @staticmethod
     def __call__(*args: typing.Any) -> CData | None: ...
+
 
 HookFuncT = typing.TypeVar("HookFuncT", bound=HookedFunction)
 
@@ -297,11 +301,12 @@ def make_landing(
     forward_only: bool = False,
     return_pop: int | None = None,
     func_prologue: bytes = b"",
-
     x86_calling_convention: CallingConventions | None = None,
 ) -> int:
     if WORDSIZE == 4 or near_addr is None:
-        landing_address = int(VirtualAlloc(None, 0x100, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ))
+        landing_address = int(
+            VirtualAlloc(None, 0x100, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ)
+        )
     else:
         # in 64bit we need memory nearby to allow reljmping to work
         granularity = 0x100000
@@ -313,12 +318,16 @@ def make_landing(
         start -= start % granularity
         end = min(near_addr + maxdist, 2**64 - 1)
         end -= end % granularity
-        
-        logger.debug(f"   ~ Want to allocate near {near_addr:#x} - searching {start:#x} -> {end:#x}")
+
+        logger.debug(
+            f"   ~ Want to allocate near {near_addr:#x} - searching {start:#x} -> {end:#x}"
+        )
         # start from almost maxdist above address, to somewhat minimize retries
         for a in range(end - granularity, start + granularity, -granularity):
             logger.debug(f"   ~ Trying to allocate at 0x{a:016x}")
-            landing_address = int(VirtualAlloc(a, 0x100, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ) or 0)
+            landing_address = int(
+                VirtualAlloc(a, 0x100, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ) or 0
+            )
             if landing_address:
                 break
         else:
@@ -351,20 +360,24 @@ def make_landing(
             elif t is bytes:
                 continue
             elif t is str:
-                raise TypeError(f"Cannot use python-strings as function arguments - use StringArg[<encoding>] or bytes instead")
+                raise TypeError(
+                    f"Cannot use python-strings as function arguments - use StringArg[<encoding>] or bytes instead"
+                )
             elif t is StringArg:
                 raise TypeError(f'StringArg types must specify an encoding e.g. StringArg["utf-8"]')
             elif typing.get_origin(t) is StringArg:
                 encoding = typing.get_args(t)[0]
                 if not isinstance(encoding, typing.ForwardRef):
-                    raise TypeError(f'StringArg[encoding] should have string encoding as argument, not {encoding}')
+                    raise TypeError(
+                        f"StringArg[encoding] should have string encoding as argument, not {encoding}"
+                    )
             elif is_pointer(t):
                 continue
             elif issubclass(t, SimpleCData):
                 continue
             else:
                 raise TypeError(f"Invalid type for hook function argument: {t}")
-    
+
     def func_wrapper(esp: int) -> bool:
         # logger.debug(f"  - Thread {GetCurrentThreadId()} running func_wrapper for {addr_desc} (0x{landing_address:08x}): {func}")
         force_return = False
@@ -380,7 +393,7 @@ def make_landing(
 
                 pushed_sp = registers.esp
                 # actual esp at time of hook is before push of registers
-                registers.esp = esp + Registers.getsize()  
+                registers.esp = esp + Registers.getsize()
 
                 func_args = list[Registers | Arguments | HookableFunctionConvertableArg]()
                 if include_registers:
@@ -404,7 +417,9 @@ def make_landing(
                                 func_args.append(ctypes.string_at(arguments[i]))
                         else:
                             func_args.append(t(arguments[i]))
-                assert len(func_args) == len(func_arg_types), f"Argument conversion failed for {func} - expected {len(func_arg_types)} but got {len(func_args)}: {func_args} vs {func_arg_types}"
+                assert len(func_args) == len(func_arg_types), (
+                    f"Argument conversion failed for {func} - expected {len(func_arg_types)} but got {len(func_args)}: {func_args} vs {func_arg_types}"
+                )
 
                 rval: HookableFunctionReturn = func(*func_args)  # type: ignore
                 if rval is not False and rval is not None:
@@ -437,8 +452,8 @@ def make_landing(
             logger.warning(
                 f"[!] Function {func} for {addr_desc} (0x{landing_address:08x}) forced return value but return_pop was not specified - stack may be corrupted"
             )
-        
-        # If the function returns an int, then return immediately from where we are in asm (hopefully just called a function) using this as the return value. 
+
+        # If the function returns an int, then return immediately from where we are in asm (hopefully just called a function) using this as the return value.
         # See the conditional in the generated landing code.
         # Let's hope the user set return_pop correctly for the calling convention...
         return force_return
@@ -446,7 +461,9 @@ def make_landing(
     func_wrapper.__name__ = f"func_wrapper_{hex(id(func))}__{func.__name__}"
     _dontgc.append(func_wrapper)
 
-    logger.debug(f"  - Patching function hook landing bytecode to call python function @ 0x{id(func):x}")
+    logger.debug(
+        f"  - Patching function hook landing bytecode to call python function @ 0x{id(func):x}"
+    )
     with Patch(landing_address) as patch:
         # save regs - could use RtlCaptureContext?
         patch.pushad()
@@ -456,7 +473,7 @@ def make_landing(
         # ensure stack is 16byte aligned - store original sp in bp so make_patch_to_py can see pushad'd regs
         patch.mov("*bp", "*sp")
         if WORDSIZE == 8:
-            patch.bytecode += b"\x48\x83\xE4\xF0"  # and rsp, -16
+            patch.bytecode += b"\x48\x83\xe4\xf0"  # and rsp, -16
 
         make_patch_to_py(patch, func_wrapper)
 
@@ -492,9 +509,7 @@ def make_landing(
         # jmp landing_exit_address
         jmp_offset = landing_exit_address - (patch.cursor + 5)
         if abs(jmp_offset) < 2**31 - 1:
-            patch.bytecode += b"\xe9" + struct.pack(
-                "<i", landing_exit_address - (patch.cursor + 5)
-            )
+            patch.bytecode += b"\xe9" + struct.pack("<i", landing_exit_address - (patch.cursor + 5))
             patch.int3()
         else:
             # push landing_exit_address
@@ -509,10 +524,14 @@ def make_landing(
 
     # caller can overwrite .unhook() if they support it
     def unhook():
-        raise NotImplementedError(f'Unhook not implemented by make_landing() - wrapper functions such as insert_hook() may provide unhooking')
+        raise NotImplementedError(
+            f"Unhook not implemented by make_landing() - wrapper functions such as insert_hook() may provide unhooking"
+        )
+
     func.unhook = unhook
 
     return landing_address
+
 
 # TRetType = typing.TypeVar("TRetType", bound=CData)
 # TArgTypes = typing.TypeVarTuple("TArgTypes")
@@ -541,18 +560,19 @@ def make_landing(
 
 #     def thiscall_pyfunc(this: typing.Any, *args: typing.Any) -> typing.Any:
 #         return thiscall_cfunc(address, this, *args)
-    
+
 #     logger.info(f"  - Created thiscall_pyfunc(this, ...) => thiscall({address:#x}, this, ...)")
 #     return thiscall_pyfunc
 
 
-
 def insert_hook(
-    addr_desc: ModuleExport | int | str,
+    addr_desc: ModuleExport | FindPattern | int | str,
     func: HookFuncT,
     position_independent_bytes: int | None = None,
     return_pop: int | None = None,
-    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]] | tuple[type[CData] | None, tuple[type[CData], ...], str] | None = None,
+    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]]
+    | tuple[type[CData] | None, tuple[type[CData], ...], str]
+    | None = None,
     remove_atexit: bool = True,
 ) -> HookFuncT:
     logger.info(f" * Hooking {addr_desc} to run {func}")
@@ -575,9 +595,9 @@ def insert_hook(
             raise ValueError(
                 "position_independent_bytes must be at least 3 (to allow for a relative jump)"
             )
-        custom = binascii.hexlify(bytes(
-            PyMemoryView_FromMemory(addr, position_independent_bytes, PyBUF_READ)
-        )).decode()
+        custom = binascii.hexlify(
+            bytes(PyMemoryView_FromMemory(addr, position_independent_bytes, PyBUF_READ))
+        ).decode()
         logger.info(
             f"  - Using custom length of position independent bytes - {position_independent_bytes} bytes from {addr:#x}: {custom}"
         )
@@ -588,20 +608,17 @@ def insert_hook(
         PyMemoryView_FromMemory(addr - 5, 5 + allowed_prologue_maxlen, PyBUF_READ)
     )
     func_prologue = func_start_mem[5:]
-    logger.info(
-        f"  - Checking prologue:       {func_prologue.hex()}"
-    )
+    logger.info(f"  - Checking prologue:       {func_prologue.hex()}")
 
-    for check_prologue in sorted(
-        allowed_prologues, key=lambda p: len(p), reverse=True
-    ):
-        if any(c not in HEXDIGITS + '? ' for c in check_prologue):
+    for check_prologue in sorted(allowed_prologues, key=lambda p: len(p), reverse=True):
+        if any(c not in HEXDIGITS + "? " for c in check_prologue):
             raise ValueError(
                 f"Invalid prologue pattern: {check_prologue} - must be hex digits or ?"
             )
-        check_prologue = ''.join(check_prologue.split())
+        check_prologue = "".join(check_prologue.split())
         expected_pattern = [
-            int(e, 16) if e != "??" else None for e in (check_prologue[i:i + 2] for i in range(0, len(check_prologue), 2))
+            int(e, 16) if e != "??" else None
+            for e in (check_prologue[i : i + 2] for i in range(0, len(check_prologue), 2))
         ]
         if all(not e or b == e for (b, e) in zip(func_prologue, expected_pattern)):
             logger.info(f"  - Matched prologue pattern {check_prologue}")
@@ -609,9 +626,14 @@ def insert_hook(
             break
         logger.debug(f"  - Did not match prologue pattern {check_prologue}")
     else:
-        raise ValueError(
-            'Function prologue did not match any of the allowed prologues - try specifying position_independent_bytes'
-        )
+        if func_prologue[0] == 0xCC:
+            raise ValueError(
+                f"Bro's trying to hook a breakpointed function: {func_prologue[:8].hex()} (Function prologue did not match any of the allowed prologues)"
+            )
+        else:
+            raise ValueError(
+                f"Function prologue did not match any of the allowed prologues - try specifying position_independent_bytes: {func_prologue[:8].hex()}..."
+            )
 
     if len(func_prologue) < 5:
         func_padding = func_start_mem[:5]
@@ -624,7 +646,9 @@ def insert_hook(
                     logger.info(f"  - Matched padding repeating byte {binascii.hexlify(allowed)}")
                     break
             else:
-                assert len(allowed) >= 5, "Require at least 5 bytes of padding, but got ALLOWED_PADDING entry with less"
+                assert len(allowed) >= 5, (
+                    "Require at least 5 bytes of padding, but got ALLOWED_PADDING entry with less"
+                )
                 potential_padding = bytes(
                     PyMemoryView_FromMemory(addr - len(allowed), len(allowed), PyBUF_READ)
                 )
@@ -633,9 +657,7 @@ def insert_hook(
                     break
 
         else:
-            raise ValueError(
-                f"Function pre-padding did not consist of 5 bytes of allowed padding"
-            )
+            raise ValueError(f"Function pre-padding did not consist of 5 bytes of allowed padding")
     else:
         func_padding = b""
 
@@ -682,8 +704,8 @@ def insert_hook(
         patch_start_addr -= 5
         with Patch(patch_start_addr) as patch:
             # jmp landing_address
-            patch.bytecode += b"\xe9" + struct.pack(
-                "<i", landing_address - addr
+            patch.bytecode += (
+                b"\xe9" + struct.pack("<i", landing_address - addr)
             )  # dont subtract 5, since we are jumping from 5 bytes earlier so this cancels the subtraction
 
             # function enters here:
@@ -697,7 +719,7 @@ def insert_hook(
     if orignal_function_spec:
         if len(orignal_function_spec) == 3:
             calltype = orignal_function_spec[2]
-            if calltype == 'thiscall':
+            if calltype == "thiscall":
                 # global thiscall_addr
                 # if not thiscall_addr:
                 #     thiscall_addr = int(VirtualAlloc(None, 0x100, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READ))
@@ -719,12 +741,16 @@ def insert_hook(
                 #     return thiscall(func.original_code_start, *args)
 
                 # func.original = call_original
-                func.original = make_thiscall(func.original_code_start, orignal_function_spec[0], *orignal_function_spec[1])
-            
+                func.original = make_thiscall(
+                    func.original_code_start, orignal_function_spec[0], *orignal_function_spec[1]
+                )
+
             else:
                 raise ValueError(f"Unknown calltype: {calltype}")
         else:
-            func.original = ctypes.CFUNCTYPE(orignal_function_spec[0], *orignal_function_spec[1])(func.original_code_start)
+            func.original = ctypes.CFUNCTYPE(orignal_function_spec[0], *orignal_function_spec[1])(
+                func.original_code_start
+            )
     else:
         func.original = ctypes.CFUNCTYPE(ctypes.c_size_t)(func.original_code_start)
 
@@ -769,9 +795,7 @@ def insert_hook(
                         )
                         return
                     else:
-                        logger.info(
-                            f"  - Function hook finished - deallocating landing address"
-                        )
+                        logger.info(f"  - Function hook finished - deallocating landing address")
 
             # This must be in a timer or it can dealloc memory before the thread wakes up
 
@@ -807,14 +831,16 @@ def _no_unhook_in_unhooked_process() -> None:
 
 
 def hook(
-    addr_desc: ModuleExport | int | str,
+    addr_desc: ModuleExport | FindPattern | int | str,
     position_independent_bytes: int | None = None,
     return_pop: int = 0,
-    orignal_function_spec: tuple[type[CData], tuple[type[CData], ...]] | tuple[type[CData], tuple[type[CData], ...], str] | None = None,
+    orignal_function_spec: tuple[type[CData], tuple[type[CData], ...]]
+    | tuple[type[CData], tuple[type[CData], ...], str]
+    | None = None,
     remove_atexit: bool = True,
 ) -> typing.Callable[[HookableFunction], HookedFunction]:
     """
-    Insert a hook at the specified address. 
+    Insert a hook at the specified address.
     The hook function will be called with a Registers object containing the registers at the time of the hook.
     The hook may return an int, which will be used as the return value of the hooked function or return None to continue execution of the hooked function.
 
@@ -825,20 +851,19 @@ def hook(
         unhook: A function that will remove the hook.
 
     args:
-    position_independent_bytes: 
+    position_independent_bytes:
         Assert that the first N bytes of the function are position independent (i.e. do not reference any absolute addresses) and consist of N instructions.
         If not specified, the first 5 bytes will be used and must match one of the known PIC prolouges.
 
-    return_pop: 
+    return_pop:
         If the hooked function returns an int, then return_pop will be used to pop the stack after the return value is set. Generally this should be the n from "ret n" at the end of the hooked function.
         If not specified, 0 will be assumed but a warning will be logged.
 
-    orignal_function_spec: 
+    orignal_function_spec:
         If specified, the original function will use this spec to call the original function.
         Format is [return type, (arg1 type, arg2 type, ...)] or [return type, (arg1 type, arg2 type, ...), calling spec (e.g. 'thiscall')].
-    
-    """
 
+    """
 
     def try_insert_hook(func: HookedFunction) -> HookedFunction:
         if not in_hooked_process:
@@ -870,7 +895,9 @@ def insert_iat_hook(
     target_module_or_function: str | Module | ResolvedFunctionImport,
     func_desc: str | None,
     func_: HookableFunction,
-    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]] | tuple[type[CData] | None, tuple[type[CData], ...], str] | None = None,
+    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]]
+    | tuple[type[CData] | None, tuple[type[CData], ...], str]
+    | None = None,
     return_pop: int = 0,
     resolve_ordinal_imports: bool = True,
 ) -> HookedFunction:
@@ -883,14 +910,14 @@ def insert_iat_hook(
             )
         iat_entry = target_module_or_function
         target_module_name = iat_entry.from_module_imports.imported_by.name
-        func_desc = f'{iat_entry.from_module_imports.name}!{iat_entry.name}'
+        func_desc = f"{iat_entry.from_module_imports.name}!{iat_entry.name}"
         logger.info(f" * Hooking {target_module_name}:{func_desc} to run {func}")
     else:
         if func_desc is None:
             raise ValueError(
                 "func_desc must be specified when target_module_or_function is a module/module name"
             )
-        
+
         if isinstance(target_module_or_function, str):
             target_module_name = target_module_or_function
             logger.info(f" * Hooking {target_module_name}:{func_desc} to run {func}")
@@ -901,7 +928,7 @@ def insert_iat_hook(
             target_module = target_module_or_function
             target_module_name = target_module.name
             logger.info(f" * Hooking {target_module}:{func_desc} to run {func}")
-        
+
         module_name, func_name_ord = func_desc.split("!")
         module_imports = target_module.imports[module_name]
         if resolve_ordinal_imports:
@@ -925,22 +952,25 @@ def insert_iat_hook(
         iat_entry.resolved_address,
         return_pop=return_pop,
     )
-    
+
     func.original_code_start = iat_entry.resolved_address
     func.original = NotImplemented
     if orignal_function_spec:
         if len(orignal_function_spec) == 3:
             calltype = orignal_function_spec[2]
-            if calltype == 'thiscall':
-                func.original = make_thiscall(func.original_code_start, orignal_function_spec[0], *orignal_function_spec[1])
+            if calltype == "thiscall":
+                func.original = make_thiscall(
+                    func.original_code_start, orignal_function_spec[0], *orignal_function_spec[1]
+                )
             else:
                 raise ValueError(f"Unknown calltype: {calltype}")
         else:
-            func.original = ctypes.CFUNCTYPE(orignal_function_spec[0], *orignal_function_spec[1])(func.original_code_start)
+            func.original = ctypes.CFUNCTYPE(orignal_function_spec[0], *orignal_function_spec[1])(
+                func.original_code_start
+            )
     else:
         func.original = ctypes.CFUNCTYPE(ctypes.c_size_t)(func.original_code_start)
     func.unhook = NotImplemented
-
 
     logger.info(f"  - Patching thunk to point to landing")
     old_permissions = ctypes.wintypes.DWORD()
@@ -951,9 +981,7 @@ def insert_iat_hook(
         PAGE_READWRITE,
         ctypes.byref(old_permissions),
     ):
-        raise ValueError(
-            "Error: VirtualProtectEx %04x" % ctypes.windll.kernel32.GetLastError()
-        )
+        raise ValueError("Error: VirtualProtectEx %04x" % ctypes.windll.kernel32.GetLastError())
     ctypes.memmove(
         iat_entry.thunk,
         ctypes.create_string_buffer(struct.pack("<" + WORDPACK, landing_address)),
@@ -966,9 +994,7 @@ def insert_iat_hook(
         old_permissions.value,
         ctypes.byref(old_permissions),
     ):
-        raise ValueError(
-            "Error: VirtualProtectEx %d" % ctypes.windll.kernel32.GetLastError()
-        )
+        raise ValueError("Error: VirtualProtectEx %d" % ctypes.windll.kernel32.GetLastError())
 
     return func
 
@@ -977,7 +1003,9 @@ def insert_iat_hook(
 def hook_iat(
     target_module_or_function: str,
     func_desc: str,
-    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]] | tuple[type[CData] | None, tuple[type[CData], ...], str] | None = None,
+    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]]
+    | tuple[type[CData] | None, tuple[type[CData], ...], str]
+    | None = None,
     return_pop: int = 0,
     resolve_ordinal_imports: bool = True,
 ) -> typing.Callable[[HookableFunction], HookedFunction]: ...
@@ -985,7 +1013,9 @@ def hook_iat(
 def hook_iat(
     target_module_or_function: Module,
     func_desc: str,
-    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]] | tuple[type[CData] | None, tuple[type[CData], ...], str] | None = None,
+    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]]
+    | tuple[type[CData] | None, tuple[type[CData], ...], str]
+    | None = None,
     return_pop: int = 0,
     resolve_ordinal_imports: bool = True,
 ) -> typing.Callable[[HookableFunction], HookedFunction]: ...
@@ -993,14 +1023,18 @@ def hook_iat(
 def hook_iat(
     target_module_or_function: ResolvedFunctionImport,
     func_desc: None = None,
-    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]] | tuple[type[CData] | None, tuple[type[CData], ...], str] | None = None,
+    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]]
+    | tuple[type[CData] | None, tuple[type[CData], ...], str]
+    | None = None,
     return_pop: int = 0,
     resolve_ordinal_imports: bool = True,
 ) -> typing.Callable[[HookableFunction], HookedFunction]: ...
 def hook_iat(
     target_module_or_function: str | Module | ResolvedFunctionImport,
     func_desc: str | None = None,
-    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]] | tuple[type[CData] | None, tuple[type[CData], ...], str] | None = None,
+    orignal_function_spec: tuple[type[CData] | None, tuple[type[CData], ...]]
+    | tuple[type[CData] | None, tuple[type[CData], ...], str]
+    | None = None,
     return_pop: int = 0,
     resolve_ordinal_imports: bool = True,
 ) -> typing.Callable[[HookableFunction], HookedFunction]:
@@ -1043,4 +1077,3 @@ __all__ = [
     "all_hooks",
     "make_thiscall",
 ]
-

@@ -6,6 +6,7 @@ import os
 import struct
 import sys
 import threading
+import time
 import types
 import typing
 
@@ -36,6 +37,7 @@ from pydetours.ctypedefs import (
     Process32Next,
     ResumeThread,
     SetDllDirectoryA,
+    SetEnvironmentVariableA,
     VirtualAllocEx,
     WaitForSingleObject,
 )
@@ -157,6 +159,9 @@ def inject(
     else:
         parts = list[str]()
         final = list[str]()
+
+        parts.append("import ctypes\nctypes.windll.kernel32.OutputDebugStringW('Stub running!')\n")
+
         if alloc_console:
             parts += [
                 inspect.getsource(pydetours.stub.alloc_console),
@@ -183,30 +188,6 @@ def inject(
                 "setup_output = setup_pipelogger",  # setup_pipelogger will call old_setup_output
             ]
             # final += ["setup_pipelogger()"]
-        parts += [
-            inspect.getsource(pydetours.stub.setup_pydetours),
-        ]
-        if exception_file:
-            final += [
-                f"""try:
-    setup_pydetours({os.getcwd()!r}, {filename!r}, {loglevel})
-except Exception as e:
-    with open({exception_file!r}, "w") as f:
-        f.write(str(e) + "\\n")
-        import traceback
-        f.write(traceback.format_exc())
-"""
-            ]
-        else:
-            final += [
-                f"""try:
-    setup_pydetours({os.getcwd()!r}, {filename!r}, {loglevel})
-except Exception as e:
-    print(f'Failed to setup pydetours: {{e}}')
-    import traceback
-    traceback.print_exc()
-"""
-            ]
 
         if pipeserver:
             parts += [
@@ -224,6 +205,35 @@ except Exception as e:
     raise
 """
             ]
+
+        # Actual hooks (after pipeserver etc.)
+        parts += [
+            inspect.getsource(pydetours.stub.setup_pydetours),
+        ]
+        if exception_file:
+            final += [
+                f"""try:
+    setup_pydetours({os.getcwd()!r}, {filename!r}, {loglevel})
+except Exception as e:
+    ctypes.windll.kernel32.OutputDebugStringW(str(e))
+    with open({exception_file!r}, "w") as f:
+        f.write(str(e) + "\\n")
+        import traceback
+        f.write(traceback.format_exc())
+"""
+            ]
+        else:
+            final += [
+                f"""try:
+    setup_pydetours({os.getcwd()!r}, {filename!r}, {loglevel})
+except Exception as e:
+    ctypes.windll.kernel32.OutputDebugStringW(str(e))
+    print(f'Failed to setup pydetours: {{e}}')
+    import traceback
+    traceback.print_exc()
+"""
+            ]
+
         python_stub = "\n".join(parts)
 
         # Check for errors
@@ -234,6 +244,9 @@ except Exception as e:
             "Python stub:\n\n"
             + "\n".join(f"{i:04d} {l}" for i, l in enumerate(python_stub.splitlines()))
         )
+
+    logger.info(f"  - Running under {sys.executable}, checking own {PYTHON_DLL} path")
+    logger.info(f"  - {sys.path=}")
 
     # n.b. if we need to enum the modules for a suspended process, we can just create and wait for a noop (ret only) remote thread as this will init the modules
     python_lib = None
@@ -261,6 +274,16 @@ except Exception as e:
     python_lib_dir = os.path.dirname(python_lib)
     python_lib_name = os.path.basename(python_lib)
 
+    # Build PYTHONPATH from parent sys.path (normalize, dedupe, skip empties)
+    parent_sys_paths: list[str] = []
+    for p in sys.path:
+        if not p:
+            continue
+        ap = os.path.abspath(p)
+        if ap not in parent_sys_paths:
+            parent_sys_paths.append(ap)
+    pythonpath_value = os.pathsep.join(parent_sys_paths)
+
     logger.info(f"  - Need to inject {python_lib}")
 
     SetDllDirectoryA_addr = ctypes.cast(SetDllDirectoryA, ctypes.c_void_p).value
@@ -271,6 +294,9 @@ except Exception as e:
 
     MessageBoxA_addr = ctypes.cast(MessageBoxA, ctypes.c_void_p).value
     logger.info(f"   ~ Resolved MessageBoxA to 0x{MessageBoxA_addr:08x}")
+
+    SetEnvironmentVariableA_addr = ctypes.cast(SetEnvironmentVariableA, ctypes.c_void_p).value
+    logger.info(f"   ~ Resolved SetEnvironmentVariableA to 0x{SetEnvironmentVariableA_addr:08x}")
 
     python_dll = modules[PYTHON_DLL]
     Py_IsInitialized = python_dll.exports["Py_IsInitialized"].address - python_dll.base
@@ -283,7 +309,7 @@ except Exception as e:
     injection_stub = VirtualAllocEx(
         process_handle,
         None,
-        len(python_stub) + 1024,
+        len(python_stub) + len(pythonpath_value) + 8192,
         MEM_COMMIT | MEM_RESERVE,
         PAGE_EXECUTE_READWRITE,
     )
@@ -297,6 +323,16 @@ except Exception as e:
 
         python_stub_address = patch.cursor
         patch.bytecode += python_stub.encode("utf-8") + b"\x00"
+
+        # Add "PYTHONHOME" name string
+        pythonhome_str_address = patch.cursor
+        patch.bytecode += b"PYTHONHOME\x00"
+
+        # Add "PYTHONPATH" name and value strings
+        pythonpath_str_address = patch.cursor
+        patch.bytecode += b"PYTHONPATH\x00"
+        pythonpath_value_address = patch.cursor
+        patch.bytecode += pythonpath_value.encode("utf-8") + b"\x00"
 
         if debug_injection:
             message_str_address = patch.cursor
@@ -314,6 +350,10 @@ except Exception as e:
 
         LoadLibraryA_addr_ptr = patch.cursor
         patch.bytecode += struct.pack("<" + WORDPACK, LoadLibraryA_addr)
+
+        # Add SetEnvironmentVariableA address pointer
+        SetEnvironmentVariableA_addr_ptr = patch.cursor
+        patch.bytecode += struct.pack("<" + WORDPACK, SetEnvironmentVariableA_addr)
 
         # NOPs before code start to make dissasembly easy to read
         # Otherwise the python_lib_name string is hard to separate out and can mangle actual instructions
@@ -358,7 +398,24 @@ except Exception as e:
         )
         patch.mov(handle, "*ax")
 
+        # SetEnvironmentVariableA("PYTHONHOME", python_lib_dir)
+        patch.call_indirect(
+            SetEnvironmentVariableA_addr_ptr,
+            pythonhome_str_address,
+            python_lib_dir_str_address,
+            cleanup_in_32bit=False,
+        )
+
+        # SetEnvironmentVariableA("PYTHONPATH", parent_sys_paths_joined)
+        patch.call_indirect(
+            SetEnvironmentVariableA_addr_ptr,
+            pythonpath_str_address,
+            pythonpath_value_address,
+            cleanup_in_32bit=False,
+        )
+
         # is_initialized = Py_IsInitialized()
+        patch.mov("*ax", handle)
         patch.call_regrelative("*ax", Py_IsInitialized)
         patch.mov(is_initialized, "*ax")
 
@@ -430,6 +487,9 @@ except Exception as e:
 
         patch.int3()
 
+    if debug_injection:
+        input(f"Call CreateRemoteThread (function=0x{injection_stub_entry:08x})")
+
     logger.info(f"   ~ Calling CreateRemoteThread (function=0x{injection_stub_entry:08x})")
     remote_thread = CreateRemoteThread(process_handle, None, 0, injection_stub_entry, None, 0, None)
     assert remote_thread
@@ -468,7 +528,16 @@ def launch(
     cmdline: str | list[str] | tuple[str],
     module_or_filename: str | types.ModuleType | None = None,
     create_new_console: bool = True,
-    **args: typing.Any,
+    alloc_console: bool = False,
+    stderr_file: str | None = None,
+    stdout_file: str | None = None,
+    loglevel: int = logging.INFO,
+    wait_for_thread: bool = False,
+    custom_python_stub: str | None = None,
+    pipeserver: bool = False,
+    pipelogger: bool = False,
+    debug_injection: bool = False,
+    exception_file: str | None = None,
 ) -> int:
     print(f" * Starting and injecting into {cmdline!r}")
     if isinstance(cmdline, list):
@@ -506,8 +575,20 @@ def launch(
         processinfo.dwProcessId,
         module_or_filename=module_or_filename,
         process_handle=processinfo.hProcess,
-        **args,
+        alloc_console=alloc_console,
+        stderr_file=stderr_file,
+        stdout_file=stdout_file,
+        loglevel=loglevel,
+        wait_for_thread=wait_for_thread,
+        custom_python_stub=custom_python_stub,
+        pipeserver=pipeserver,
+        pipelogger=pipelogger,
+        debug_injection=debug_injection,
+        exception_file=exception_file,
     )
+
+    # FIXME: Better way to confirm the python thread is done
+    time.sleep(1.6)
 
     logger.info(f"  - Resuming main thread")
     ResumeThread(processinfo.hThread)

@@ -18,7 +18,7 @@ from pydetours.pe32_module import own_process_handle
 
 
 @typing.overload
-def asm(bytecode: bytes) -> typing.Callable[[Patch], None]:    ...
+def asm(bytecode: bytes) -> typing.Callable[[Patch], None]: ...
 @typing.overload
 def asm(bytecode: dict[str, bytes]) -> typing.Callable[[Patch, str], None]: ...
 def asm(bytecode: bytes | dict[str, bytes]) -> typing.Any:
@@ -46,29 +46,91 @@ REX1 = b"" if WORDSIZE == 4 else b"\x48"  # REX prefix for x64 - converts r/m32 
 
 
 RegisterName = typing.Literal[
-    "*ax",  "rax",  "eax",  "ax",   "al",
-    "*cx",  "rcx",  "ecx",  "cx",   "cl",
-    "*dx",  "rdx",  "edx",  "dx",   "dl",
-    "*bx",  "rbx",  "ebx",  "bx",   "bl",
-    "*si",  "rsi",  "esi",  "si",   "sil",
-    "*di",  "rdi",  "edi",  "di",   "dil",
-    "*sp",  "rsp",  "esp",  "sp",   "spl",
-    "*bp",  "rbp",  "ebp",  "bp",   "bpl",
-    "*8",   "r8",   "r8d",  "r8w",  "r8b",
-    "*9",   "r9",   "r9d",  "r9w",  "r9b",
-    "*10",  "r10",  "r10d", "r10w", "r10b",
-    "*11",  "r11",  "r11d", "r11w", "r11b",
-    "*12",  "r12",  "r12d", "r12w", "r12b",
-    "*13",  "r13",  "r13d", "r13w", "r13b",
-    "*14",  "r14",  "r14d", "r14w", "r14b",
-    "*15",  "r15",  "r15d", "r15w", "r15b",
+    "*ax",
+    "rax",
+    "eax",
+    "ax",
+    "al",
+    "*cx",
+    "rcx",
+    "ecx",
+    "cx",
+    "cl",
+    "*dx",
+    "rdx",
+    "edx",
+    "dx",
+    "dl",
+    "*bx",
+    "rbx",
+    "ebx",
+    "bx",
+    "bl",
+    "*si",
+    "rsi",
+    "esi",
+    "si",
+    "sil",
+    "*di",
+    "rdi",
+    "edi",
+    "di",
+    "dil",
+    "*sp",
+    "rsp",
+    "esp",
+    "sp",
+    "spl",
+    "*bp",
+    "rbp",
+    "ebp",
+    "bp",
+    "bpl",
+    "*8",
+    "r8",
+    "r8d",
+    "r8w",
+    "r8b",
+    "*9",
+    "r9",
+    "r9d",
+    "r9w",
+    "r9b",
+    "*10",
+    "r10",
+    "r10d",
+    "r10w",
+    "r10b",
+    "*11",
+    "r11",
+    "r11d",
+    "r11w",
+    "r11b",
+    "*12",
+    "r12",
+    "r12d",
+    "r12w",
+    "r12b",
+    "*13",
+    "r13",
+    "r13d",
+    "r13w",
+    "r13b",
+    "*14",
+    "r14",
+    "r14d",
+    "r14w",
+    "r14b",
+    "*15",
+    "r15",
+    "r15d",
+    "r15w",
+    "r15b",
 ]
 
 
 class Patch:
-    def __init__(
-        self, address: int, process_handle: ctypes.wintypes.HANDLE | None = None
-    ) -> None:
+    def __init__(self, address: int, process_handle: ctypes.wintypes.HANDLE | None = None) -> None:
         self.address = address
         if not process_handle:
             process_handle = own_process_handle
@@ -85,24 +147,18 @@ class Patch:
                 self.bytecode += b"\x68" + struct.pack("<I", a)
         else:
             assert len(args) <= 4
-            for a, rcode in zip(
-                args, (b"\x48\xb9", b"\x48\xba", b"\x49\xb8", b"\x49\xb9")
-            ):
+            for a, rcode in zip(args, (b"\x48\xb9", b"\x48\xba", b"\x49\xb8", b"\x49\xb9")):
                 if isinstance(a, int):
                     self.bytecode += rcode + struct.pack("<Q", a)
                 else:
                     raise ValueError(f"Don't know how to set arg {a!r}")
 
-    def call_indirect(
-        self, funcptr: int, *args: int, cleanup_in_32bit: bool = True
-    ) -> None:
+    def call_indirect(self, funcptr: int, *args: int, cleanup_in_32bit: bool = True) -> None:
         self.set_args(args)
         if WORDSIZE == 4:
             self.bytecode += b"\xff\x15" + struct.pack("<I", funcptr)  # call [&funcptr]
             if cleanup_in_32bit and len(args):
-                self.bytecode += b"\x83\xc4" + struct.pack(
-                    "<B", len(args) * 4
-                )  # add esp
+                self.bytecode += b"\x83\xc4" + struct.pack("<B", len(args) * 4)  # add esp
         else:
             self.bytecode += b"\x48\x83\xec\x20"  # sub rsp, 32; shadow space
             self.bytecode += b"\xff\x15" + struct.pack(
@@ -141,13 +197,9 @@ class Patch:
 
             # unwind stack
             if cleanup_in_32bit and len(args):
-                self.bytecode += b"\x83\xc4" + struct.pack(
-                    "<B", len(args) * 4
-                )  # add esp
+                self.bytecode += b"\x83\xc4" + struct.pack("<B", len(args) * 4)  # add esp
         else:
-            self.bytecode += b"\x48\xb8" + struct.pack(
-                "<Q", funcaddr
-            )  # mov rax, funcaddr
+            self.bytecode += b"\x48\xb8" + struct.pack("<Q", funcaddr)  # mov rax, funcaddr
             self.bytecode += b"\x48\x83\xec\x20"  # sub rsp, 32; shadow space
             self.bytecode += b"\xff\xd0"  # call rax
             self.bytecode += b"\x48\x83\xc4\x20"  # add rsp, 32 ; shadow space
@@ -198,11 +250,11 @@ class Patch:
         ("r12", "rax"): b"\x4c\x8b\xe0",
         ("r13", "rax"): b"\x4c\x8b\xe8",
         ("r14", "rax"): b"\x4c\x8b\xf0",
-        ("rdx", "r13"): b"\x49\x8B\xD5",
-        ("rdx", "r14"): b"\x49\x8B\xD6",
-        ("rcx", "r14"): b"\x49\x8B\xCE",
-        ("rcx", "r13"): b"\x49\x8B\xCD",
-        ("rcx", "r12"): b"\x49\x8B\xCC",
+        ("rdx", "r13"): b"\x49\x8b\xd5",
+        ("rdx", "r14"): b"\x49\x8b\xd6",
+        ("rcx", "r14"): b"\x49\x8b\xce",
+        ("rcx", "r13"): b"\x49\x8b\xcd",
+        ("rcx", "r12"): b"\x49\x8b\xcc",
     }
 
     def mov(self, a1: RegisterName | str, a2: RegisterName | str | int) -> None:
@@ -214,9 +266,7 @@ class Patch:
             else:
                 size = "I"
             try:
-                self.bytecode += (
-                    self.PREFIX[a1[0]] + b"\xb8" + struct.pack("<" + size, int(a2))
-                )
+                self.bytecode += self.PREFIX[a1[0]] + b"\xb8" + struct.pack("<" + size, int(a2))
                 return
             except:
                 pass
@@ -227,12 +277,7 @@ class Patch:
             ofs = int(a1[4:-1])
             pre = self.PREFIX[a1[1]]
             self.bytecode += pre + b"\x89\x45" + struct.pack("b", ofs)
-        elif (
-            a2[0] == "["
-            and a2[2:4] == "bp"
-            and a1[1:] in ["ax", "cx"]
-            and a2[1] == a1[0]
-        ):
+        elif a2[0] == "[" and a2[2:4] == "bp" and a1[1:] in ["ax", "cx"] and a2[1] == a1[0]:
             # mov ?ax, [?bp+?] / mov ?cx, [?bp+?]
             ofs = int(a2[4:-1])
             pre = self.PREFIX[a2[1]]
@@ -285,9 +330,7 @@ class Patch:
             PAGE_EXECUTE_READWRITE,
             ctypes.byref(old_permissions),
         ):
-            raise ValueError(
-                "Error: VirtualProtectEx %04x" % ctypes.windll.kernel32.GetLastError()
-            )
+            raise ValueError("Error: VirtualProtectEx %04x" % ctypes.windll.kernel32.GetLastError())
         if self.process_handle == own_process_handle:
             ctypes.memmove(self.address, self.bytecode, len(self.bytecode))
         else:
@@ -299,8 +342,7 @@ class Patch:
                 None,
             ):
                 raise ValueError(
-                    "Error: WriteProcessMemory %d"
-                    % ctypes.windll.kernel32.GetLastError()
+                    "Error: WriteProcessMemory %d" % ctypes.windll.kernel32.GetLastError()
                 )
         if not VirtualProtectEx(
             self.process_handle,
@@ -309,10 +351,7 @@ class Patch:
             old_permissions.value,
             ctypes.byref(old_permissions),
         ):
-            raise ValueError(
-                "Error: VirtualProtectEx %d" % ctypes.windll.kernel32.GetLastError()
-            )
-
+            raise ValueError("Error: VirtualProtectEx %d" % ctypes.windll.kernel32.GetLastError())
 
 
 class Registers:
@@ -340,8 +379,7 @@ class Registers:
     REGISTERS_PUSHAD_ORDER = (
         (["eflags"] + REGISTERS_64BIT_PUSHAD_ORDER + REGISTERS_32BIT_PUSHAD_ORDER)
         if WORDSIZE == 8
-        else
-        (["eflags"] + REGISTERS_32BIT_PUSHAD_ORDER)
+        else (["eflags"] + REGISTERS_32BIT_PUSHAD_ORDER)
     )
 
     def __init__(self, buf: bytes | memoryview, eip: int) -> None:
@@ -354,6 +392,16 @@ class Registers:
         ):
             setattr(self, rname, rval)
         self.eip = eip
+        if WORDSIZE == 8:
+            self.rip = eip
+            self.rdi = self.edi
+            self.rsi = self.esi
+            self.rbp = self.ebp
+            self.rsp = self.esp
+            self.rbx = self.ebx
+            self.rdx = self.edx
+            self.rcx = self.ecx
+            self.rax = self.eax
 
     def pack(self) -> bytes:
         vals = [getattr(self, rname) for rname in self.REGISTERS_PUSHAD_ORDER]
@@ -366,6 +414,7 @@ class Registers:
         return WORDSIZE * len(cls.REGISTERS_PUSHAD_ORDER)
 
     def __str__(self) -> str:
+        # TODO: this prints "e**" registers on x64
         return (
             "Registers("
             + ", ".join(
@@ -445,23 +494,17 @@ class Arguments(typing.Iterable[int]):
 
     def __str__(self) -> str:
         if self.argcount is not None:
-            return (
-                "Arguments["
-                + ", ".join(hex(self[i]) for i in range(self.argcount))
-                + "]"
-            )
+            return "Arguments[" + ", ".join(hex(self[i]) for i in range(self.argcount)) + "]"
         else:
-            return (
-                "Arguments[...? "
-                + ", ".join(hex(self[i]) for i in range(4))
-                + ", ...?]"
-            )
+            return "Arguments[...? " + ", ".join(hex(self[i]) for i in range(4)) + ", ...?]"
 
     __repr__ = __str__
 
 
 class ArgumentsStackAdjust(Arguments):
-    def __init__(self, registers: Registers, adjust: int, argcount: int, x86_convention: str = "stdcall"):
+    def __init__(
+        self, registers: Registers, adjust: int, argcount: int, x86_convention: str = "stdcall"
+    ):
         freg = Registers(registers.pack(), registers.eip)
         freg.esp += adjust
         return super().__init__(registers=freg, argcount=argcount, x86_convention=x86_convention)

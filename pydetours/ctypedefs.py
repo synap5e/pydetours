@@ -309,3 +309,7 @@ strnlen.restype = ctypes.c_size_t
 MessageBoxA = ctypes.windll.user32.MessageBoxA
 MessageBoxA.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint32]
 MessageBoxA.restype = ctypes.c_int
+
+SetEnvironmentVariableA = ctypes.windll.kernel32.SetEnvironmentVariableA
+SetEnvironmentVariableA.restype = ctypes.wintypes.BOOL
+SetEnvironmentVariableA.argtypes = (ctypes.c_char_p, ctypes.c_char_p)

@@ -29,16 +29,13 @@ class UntypedPointerDeref(ValueError):
 @typing.runtime_checkable
 class _HasFromAddress(typing.Protocol):
     @classmethod
-    def from_buffer(cls, source: bytes, offset: int = ...) -> _HasFromAddress:
-        ...
+    def from_buffer(cls, source: bytes, offset: int = ...) -> _HasFromAddress: ...
 
     @classmethod
-    def from_buffer_copy(cls, source: bytes, offset: int = ...) -> _HasFromAddress:
-        ...
+    def from_buffer_copy(cls, source: bytes, offset: int = ...) -> _HasFromAddress: ...
 
     @classmethod
-    def from_address(cls, address: int) -> _HasFromAddress:
-        ...
+    def from_address(cls, address: int) -> _HasFromAddress: ...
 
     # value: typing.Any
 
@@ -56,6 +53,7 @@ class _UndefinedType:
     PRIVATE TYPE - DO NOT EXPORT.
     For "untyped" pointers, use `Pointer[None]` instead - this type is used internally to represent when a pointer must try to infer its type from its __orig_class__.
     """
+
     pass
 
 
@@ -107,17 +105,31 @@ class BasePointer(typing.Generic[StoredDerefType]):
         if isinstance(offsets, int):
             offsets = (offsets,)
         if offset and sum(offsets):
-            raise ValueError(
-                f"Cannot specify both offset and offsets for {self.__class__}"
-            )
-        if not isinstance(offsets, collections.abc.Sequence) or any(not isinstance(o, int) for o in offsets):  # type: ignore
+            raise ValueError(f"Cannot specify both offset and offsets for {self.__class__}")
+        if not isinstance(offsets, collections.abc.Sequence) or any(
+            not isinstance(o, int) for o in offsets
+        ):  # type: ignore
             raise TypeError(f"Invalid offset {offsets} for {self.__class__}")
         self.offsets: tuple[int, ...] = offsets
         self.length = length
-        logger.debug(f"Creating {self.__class__} with {base_address=}, {type_=}, {offset=}, {offsets=}, {length=}, {encoding=}")
+        logger.debug(
+            f"Creating {self.__class__} with {base_address=}, {type_=}, {offset=}, {offsets=}, {length=}, {encoding=}"
+        )
         self.type_: type = type_
         self.encoding = encoding
         self._int_cache: int | None = None
+
+    def at(self, index: int) -> BasePointer[BasePointer[StoredDerefType]]:
+        """
+        Create a new pointer at the given index, relative to this pointer.
+        """
+        origin = typing.get_origin(self.__class__) or self.__class__
+        base_address = self.copy(offsets=self.offsets + (index * ctypes.sizeof(self.type),))
+        return origin(
+            base_address,
+            self.type,
+            (0,),
+        )
 
     @typing.overload
     def copy(
@@ -159,7 +171,7 @@ class BasePointer(typing.Generic[StoredDerefType]):
             base_address=base_address,
             offsets=offsets,
             length=length,
-            type_=type_,   # type: ignore
+            type_=type_,  # type: ignore
             encoding=encoding,
         )  # type: ignore
 
@@ -201,11 +213,7 @@ class BasePointer(typing.Generic[StoredDerefType]):
         else:
             base_addr_str = "null"
         if self.offset:
-            return (
-                f"({base_addr_str}+"
-                + "+".join(f"{o:#x}" for o in self.offsets if o)
-                + ")"
-            )
+            return f"({base_addr_str}+" + "+".join(f"{o:#x}" for o in self.offsets if o) + ")"
         else:
             return f"{base_addr_str}"
 
@@ -215,19 +223,17 @@ class BasePointer(typing.Generic[StoredDerefType]):
     }
 
     @typing.overload
-    def deref(self) -> StoredDerefType:
-        ...
+    def deref(self) -> StoredDerefType: ...
 
     @typing.overload
-    def deref(self, type_: typing.Type[DerefType]) -> DerefType:
-        ...
+    def deref(self, type_: typing.Type[DerefType]) -> DerefType: ...
 
     def deref(self, type_: typing.Type[DerefType] | None = None):
         if not type_:
             type_ = self.type
         if type_ is type(None):
             raise UntypedPointerDeref(f"Cannot dereference untyped {self.__class__}")
-        
+
         assert type_ is not _UndefinedType
 
         if isinstance(self.base_address, BasePointer):
@@ -296,7 +302,9 @@ class BasePointer(typing.Generic[StoredDerefType]):
     def deref_string(self, encoding: str, max_length: int | None = None) -> str: ...
     @typing.overload
     def deref_string(self, encoding: None, max_length: int | None = None) -> bytes: ...
-    def deref_string(self, encoding: str | None = "ascii", max_length: int | None = None) -> str | bytes:
+    def deref_string(
+        self, encoding: str | None = "ascii", max_length: int | None = None
+    ) -> str | bytes:
         if not int(self):
             raise ValueError(f"Cannot read string from null pointer")
         # logger.debug(f'Dereferencing {self.addr_str} > {int(self):#x} as str')
@@ -334,7 +342,9 @@ class BasePointer(typing.Generic[StoredDerefType]):
                 str_val += repr(self)
             elif self.type == ctypes.c_void_p:
                 try:
-                    str_val += f"{typing.cast(BasePointer[ctypes.c_void_p], self).deref().value or 0:#x}"
+                    str_val += (
+                        f"{typing.cast(BasePointer[ctypes.c_void_p], self).deref().value or 0:#x}"
+                    )
                 except (NullPointerDeref, OSError) as e:
                     str_val += f"<ERROR IN DEREF: {e}>"
                     lines = "\n".join(traceback.format_exc().splitlines())
@@ -365,18 +375,24 @@ class BasePointer(typing.Generic[StoredDerefType]):
 
     def __repr__(self):
         return self.type_name + "(" + self.addr_str + ")"
-    
+
     # def __getitem__(self, type_: typing.Type[DerefType]) -> BasePointer[DerefType]:
     #     if self.type == type_:
     #         return typing.cast(BasePointer[DerefType], self)
     #     return self.cast(type_)
 
     def __getitem__(self, i: int) -> typing.Self:
-        return self.copy(offsets=self.offsets + (i * ctypes.sizeof(self.type),))
+        if isinstance(self.type, BasePointer) or typing.get_origin(self.type) is BasePointer:
+            size = ctypes.sizeof(ctypes.c_void_p)
+        else:
+            logger.debug(f"Computing size of {self.type} for __getitem__")
+            size = ctypes.sizeof(self.type)
+        return self.copy(offsets=self.offsets + (i * size,))
 
-    
     # def __getattr__[DerefType](self, name: str) -> BasePointer[DerefType]:
-    def __getattr__(self, name: str, as_: typing.Type[DerefType] | None = None) -> BasePointer[typing.Any]:
+    def __getattr__(
+        self, name: str, as_: typing.Type[DerefType] | None = None
+    ) -> BasePointer[typing.Any]:
         """
         If this Pointer points to a dataclass, create an offset (i.e. relative to this) pointer to the dataclasses field `name`.
 
@@ -411,7 +427,7 @@ class BasePointer(typing.Generic[StoredDerefType]):
         if name == "__orig_class__":
             # IMPORTANT: make sure this is checked *before* we attempt to access call pointer_type() (or access .type which calls pointer_type())
             raise AttributeError(name)
-        
+
         type_ = self.type_
         if type_ is _UndefinedType:
             type_ = pointer_type(self)
@@ -435,9 +451,7 @@ class BasePointer(typing.Generic[StoredDerefType]):
                     #           int *b;         <- adjusted_pointer <- result
                     # which is more or less
                     #           int b;          <- result
-                    adjusted_pointer = self.copy(
-                        offsets=new_offsets, type_=ctypes.c_void_p
-                    )
+                    adjusted_pointer = self.copy(offsets=new_offsets, type_=ctypes.c_void_p)
                     result = field_origin(adjusted_pointer, type_=dataclass_type)  # type: ignore
                 else:
                     # If it's not a pointer, we just create a copy of our own pointer with the offsets updated
@@ -460,8 +474,7 @@ class BasePointer(typing.Generic[StoredDerefType]):
     #     super().__setattr__(name, value)
 
     @abstractmethod
-    def read(self, length: int | None = None) -> bytes | memoryview:
-        ...
+    def read(self, length: int | None = None) -> bytes | memoryview: ...
 
     @property
     @abstractmethod
@@ -478,8 +491,6 @@ class BasePointer(typing.Generic[StoredDerefType]):
         raise NotImplementedError("Not implemented")
 
 
-
-
 class UnsafePointer(BasePointer[DerefType]):
     def __init__(self, *args: typing.Any, **kwargs: typing.Any) -> None:
         self._view: memoryview | None = None
@@ -490,18 +501,14 @@ class UnsafePointer(BasePointer[DerefType]):
     @property
     def readable_view(self) -> memoryview:
         if not self._view:
-            self._view = PyMemoryView_FromMemory(
-                int(self), self.length or MAXINT, PyBUF_READ
-            )
+            self._view = PyMemoryView_FromMemory(int(self), self.length or MAXINT, PyBUF_READ)
             assert self._view
         return self._view
 
     @property
     def writeable_view(self) -> memoryview:
         if not self._view_w:
-            self._view_w = PyMemoryView_FromMemory(
-                int(self), self.length or MAXINT, PyBUF_WRITE
-            )
+            self._view_w = PyMemoryView_FromMemory(int(self), self.length or MAXINT, PyBUF_WRITE)
             assert self._view_w
         return self._view_w
 
@@ -539,12 +546,19 @@ class SafePointer(BasePointer[DerefType]):
 
     def deref_from_address(self, type_: HasFromAddress) -> typing.Any:
         # FIXME: support write
-        return type_.from_buffer_copy(
-            self.read(ctypes.sizeof(typing.cast(typing.Any, type_)))
-        )
+        return type_.from_buffer_copy(self.read(ctypes.sizeof(typing.cast(typing.Any, type_))))
 
 
 Pointer = SafePointer
 
 
-__all__ = ["BasePointer", "SafePointer", "UnsafePointer", "Pointer", "is_pointer", "pointer_type", "NullPointerDeref", "UntypedPointerDeref"]
+__all__ = [
+    "BasePointer",
+    "SafePointer",
+    "UnsafePointer",
+    "Pointer",
+    "is_pointer",
+    "pointer_type",
+    "NullPointerDeref",
+    "UntypedPointerDeref",
+]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ast import Not
 import ctypes
 import ctypes.wintypes
 import logging
@@ -34,7 +35,7 @@ class FunctionImport:
 
     def __str__(self) -> str:
         return f"FunctionImport(name_or_ordinal={self.name_or_ordinal!r}, thunk={self.thunk:#x}, addr={self.addr:#x})"
-    
+
     __repr__ = __str__
 
 
@@ -44,7 +45,13 @@ class ModuleImport:
     This class stores the name of the imported module and the list of functions imported from that module.
     """
 
-    def __init__(self, name: str, unresolved: list[FunctionImport], imported_by: Module, handle: int | None = None):
+    def __init__(
+        self,
+        name: str,
+        unresolved: list[FunctionImport],
+        imported_by: Module,
+        handle: int | None = None,
+    ):
         self.name = name
         self.unresolved = unresolved
         self.imported_by = imported_by
@@ -66,7 +73,9 @@ class ModuleImport:
                         logf = logger.warning
                     else:
                         logf = logger.debug
-                    logf(f" {self.imported_by.name} imports {self.name}!{func.name_or_ordinal} (thunk=0x{func.thunk:08x}), but {self.name} has no matching export")
+                    logf(
+                        f" {self.imported_by.name} imports {self.name}!{func.name_or_ordinal} (thunk=0x{func.thunk:08x}), but {self.name} has no matching export"
+                    )
                     continue
                 new_resolved_address = self.memory.native_word(func.thunk)
                 # if exp.address != new_resolved_address:
@@ -81,9 +90,7 @@ class ModuleImport:
                         thunk=func.thunk,
                         original_address=exp.address,
                         resolved_address=new_resolved_address,
-
                         from_module_imports=self,
-
                         baddr=func.addr,
                     )
                 )
@@ -315,14 +322,24 @@ class Module:
         if self.export_directory_data and self.export_directory_data[0] != 0:
             ExportDir = self.base + self.export_directory_data[0]
             try:
-                NumberOfFunctions, NumberOfNames, AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals = self.memory[ExportDir + 20 : ExportDir + 40 : 4]
+                (
+                    NumberOfFunctions,
+                    NumberOfNames,
+                    AddressOfFunctions,
+                    AddressOfNames,
+                    AddressOfNameOrdinals,
+                ) = self.memory[ExportDir + 20 : ExportDir + 40 : 4]
             except:
-                logger.warning(f'Failed to read export directory for {self.name}')
+                logger.warning(f"Failed to read export directory for {self.name}")
                 return ModuleExports()
 
-            function_addrs = self.memory.read_array(self.base + AddressOfFunctions, NumberOfFunctions, 4)
+            function_addrs = self.memory.read_array(
+                self.base + AddressOfFunctions, NumberOfFunctions, 4
+            )
             name_addrs = self.memory.read_array(self.base + AddressOfNames, NumberOfNames, 4)
-            name_ordinals = self.memory.read_array(self.base + AddressOfNameOrdinals, NumberOfNames, 2)
+            name_ordinals = self.memory.read_array(
+                self.base + AddressOfNameOrdinals, NumberOfNames, 2
+            )
 
             # function_addrs, name_addrs, name_ordinals are RVA to self.base
 
@@ -353,10 +370,12 @@ class Module:
             current_import_descriptor = ImportDir
             for i in range(self.import_directory_data[1] // 20):
                 try:
-                    OriginalFirstThunk, TimeDateStamp, ForwarderChain, Name, FirstThunk = self.memory[current_import_descriptor : current_import_descriptor + 20 : 4]
+                    OriginalFirstThunk, TimeDateStamp, ForwarderChain, Name, FirstThunk = (
+                        self.memory[current_import_descriptor : current_import_descriptor + 20 : 4]
+                    )
                 except:
                     # FIXME: what is happening here?
-                    logger.error(f'Failed to data for {self.name}\'s imports: {i=}')
+                    logger.error(f"Failed to data for {self.name}'s imports: {i=}")
                     continue
                 if not OriginalFirstThunk:
                     break
@@ -366,7 +385,9 @@ class Module:
                     module_name = self.memory.cstr(self.base + Name)
                 except:
                     # FIXME: what is happening here?
-                    logger.error(f'Failed to read module name for {self.name}\'s imports: {i=} : {OriginalFirstThunk=:#x}, {self.base=:#x} {Name=:#x} {FirstThunk=:#x}')
+                    logger.error(
+                        f"Failed to read module name for {self.name}'s imports: {i=} : {OriginalFirstThunk=:#x}, {self.base=:#x} {Name=:#x} {FirstThunk=:#x}"
+                    )
                     continue
                 # logger.info(f'{module_name.ljust(42)} OriginalFirstThunk=0x{self.base + OriginalFirstThunk:016x}, FirstThunk=0x{self.base + FirstThunk:016x}')
 
@@ -384,22 +405,15 @@ class Module:
                         # ordinal
                         func_name_ord = original_thunk_rva & 0xFFFF
                     else:
-                        func_name_ord = self.memory.cstr(
-                            self.base + original_thunk_rva + 2
-                        )
+                        func_name_ord = self.memory.cstr(self.base + original_thunk_rva + 2)
 
                     functions.append(
-                        FunctionImport(
-                            func_name_ord, func_ptr_addr, self.base + original_thunk_rva
-                        )
+                        FunctionImport(func_name_ord, func_ptr_addr, self.base + original_thunk_rva)
                     )
 
                 imports.append(
                     ModuleImport(
-                        module_name, 
-                        functions, 
-                        imported_by=self, 
-                        handle=self.process_handle
+                        module_name, functions, imported_by=self, handle=self.process_handle
                     )
                 )
 
@@ -432,9 +446,7 @@ class Modules(dict[str, Module]):
         r = dict[str, Module]()
         hMods = (ctypes.c_void_p * 1024)()
         cbNeeded = ctypes.c_ulong()
-        if not EnumProcessModules(
-            self.handle, hMods, ctypes.sizeof(hMods), ctypes.byref(cbNeeded)
-        ):
+        if not EnumProcessModules(self.handle, hMods, ctypes.sizeof(hMods), ctypes.byref(cbNeeded)):
             raise ValueError(
                 f"EnumProcessModules failed. Error=0x{ctypes.windll.kernel32.GetLastError():x}"
             )
@@ -457,11 +469,22 @@ own_process_handle = GetCurrentProcess()
 modules = Modules(own_process_handle)
 
 
-def resolve_addr(address_desc: ModuleExport | int | str) -> int:
+class FindPattern:
+    def __init__(self, module_name: str, pattern: str):
+        self.module_name: str = module_name
+        self.pattern: str = pattern
+
+    def find(self) -> int:
+        raise NotImplementedError()
+
+
+def resolve_addr(address_desc: ModuleExport | FindPattern | int | str) -> int:
     if isinstance(address_desc, ModuleExport):
         return address_desc.address
     elif isinstance(address_desc, int):
         return address_desc
+    elif isinstance(address_desc, FindPattern):
+        return address_desc.find()
     elif "+" in address_desc:
         module, offset_s = address_desc.split("+")
         if offset_s.startswith("0x"):
@@ -472,9 +495,7 @@ def resolve_addr(address_desc: ModuleExport | int | str) -> int:
         assert base is not None
         return base + offset
     else:
-        raise ValueError(
-            "Don't know how to support address description %r" % address_desc
-        )
+        raise ValueError("Don't know how to support address description %r" % address_desc)
 
 
 __all__ = [
