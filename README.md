@@ -1,6 +1,6 @@
 # pydetours
 
-Single file, 0 compilation, 0 dependancy (other than python), x86/x86_64 hooking in python.
+0 compilation, 0 dependancy x86/x86_64 hooking in python.
 
 ## Examples
 
